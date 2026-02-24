@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+data/beetv_playlist.m3u
+data/*.log
+.idea/
+.vscode/

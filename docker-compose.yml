@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  restream:
+    build: .
+    container_name: beetv-restream
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      - HTTP_PROXY=http://192.168.30.63:3129
+      - HTTPS_PROXY=http://192.168.30.63:3129
+      - http_proxy=http://192.168.30.63:3129
+      - https_proxy=http://192.168.30.63:3129
+      - M3U_PATH=/data/beetv_playlist.m3u
+      - VIDEO_BW=1087600
+      - AUTOSTART=false
+      - HOST=0.0.0.0
+      - PORT=8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
