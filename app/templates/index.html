@@ -788,28 +788,25 @@ function render() {
 // ============================================================
 // Copy URL
 // ============================================================
+function clipCopy(text) {
+    // Работает на HTTP (без HTTPS)
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0;left:-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { document.execCommand('copy'); } catch(e) {}
+    document.body.removeChild(ta);
+}
+
 function copyUrl(channelId, name, btn) {
     const url = `${window.location.origin}/stream/${channelId}`;
-    navigator.clipboard.writeText(url).then(() => {
-        btn.textContent = 'OK!';
-        btn.classList.add('copied');
-        toast(`URL copied: ${name}`, 'success');
-        setTimeout(() => { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 1500);
-    }).catch(() => {
-        // fallback
-        const ta = document.createElement('textarea');
-        ta.value = url;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        btn.textContent = 'OK!';
-        btn.classList.add('copied');
-        toast(`URL copied: ${name}`, 'success');
-        setTimeout(() => { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 1500);
-    });
+    clipCopy(url);
+    btn.textContent = 'OK!';
+    btn.classList.add('copied');
+    toast(`URL copied: ${name}`, 'success');
+    setTimeout(() => { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 1500);
 }
 
 // ============================================================
@@ -902,7 +899,7 @@ document.getElementById('modalOverlay').addEventListener('click', e => {
 
 document.getElementById('modalCopy').addEventListener('click', () => {
     const url = document.getElementById('modalUrl').textContent;
-    navigator.clipboard.writeText(url);
+    clipCopy(url);
     const btn = document.getElementById('modalCopy');
     btn.textContent = 'COPIED!';
     btn.classList.add('copied');
