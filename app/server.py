@@ -4,14 +4,13 @@ BeeTV Restream Server
 Flask app: веб-панель + HTTP потоки + API управления
 """
 
-import json
 import logging
 import os
 import queue
 import signal
 import sys
 import time
-from flask import Flask, Response, render_template, jsonify, request, send_from_directory
+from flask import Flask, Response, render_template, jsonify, request
 
 from restreamer import ChannelManager
 
@@ -19,7 +18,7 @@ from restreamer import ChannelManager
 # Конфигурация
 # ============================================================
 M3U_PATH = os.environ.get("M3U_PATH", "/data/beetv_playlist.m3u")
-VIDEO_BW = int(os.environ.get("VIDEO_BW", "1087600"))  # 480x384
+VIDEO_BW = int(os.environ.get("VIDEO_BW", "1087600"))
 AUTOSTART = os.environ.get("AUTOSTART", "true").lower() == "true"
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -34,9 +33,10 @@ log = logging.getLogger("server")
 # ============================================================
 # Flask App
 # ============================================================
-app = Flask(__name__, 
-            template_folder="/app/templates",
-            static_folder="/app/static")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(__name__,
+            template_folder=os.path.join(BASE_DIR, "templates"),
+            static_folder=os.path.join(BASE_DIR, "static"))
 
 manager = ChannelManager()
 
@@ -51,7 +51,7 @@ def index():
 
 
 # ============================================================
-# API
+# API — Каналы
 # ============================================================
 @app.route("/api/channels")
 def api_channels():
@@ -105,11 +105,58 @@ def api_stats():
     })
 
 
+# ============================================================
+# API — Управление
+# ============================================================
 @app.route("/api/reload", methods=["POST"])
 def api_reload():
     """Перезагрузить список каналов из M3U"""
     count = manager.load_from_m3u(M3U_PATH, autostart=AUTOSTART, video_bw=VIDEO_BW)
     return jsonify({"loaded": count})
+
+
+@app.route("/api/start-all", methods=["POST"])
+def api_start_all():
+    """Запустить все каналы"""
+    started = 0
+    for ch in manager.channels.values():
+        if not ch.running:
+            ch.start()
+            started += 1
+    return jsonify({"started": started})
+
+
+@app.route("/api/stop-all", methods=["POST"])
+def api_stop_all():
+    """Остановить все каналы"""
+    stopped = 0
+    for ch in manager.channels.values():
+        if ch.running:
+            ch.stop()
+            stopped += 1
+    return jsonify({"stopped": stopped})
+
+
+# ============================================================
+# M3U плейлист рестримов
+# ============================================================
+@app.route("/playlist.m3u")
+def playlist_m3u():
+    """Сгенерировать M3U плейлист со всеми рестрим-ссылками"""
+    host = request.host
+    scheme = request.scheme
+    base = f"{scheme}://{host}"
+
+    lines = ["#EXTM3U"]
+    for ch in manager.channels.values():
+        lines.append(f'#EXTINF:-1 tvg-id="{ch.channel_id}" tvg-name="{ch.name}",{ch.name}')
+        lines.append(f"{base}/stream/{ch.channel_id}")
+
+    return Response(
+        "\n".join(lines) + "\n",
+        mimetype="audio/x-mpegurl",
+        headers={"Content-Disposition": "attachment; filename=beetv_restream.m3u"},
+    )
 
 
 # ============================================================
@@ -124,10 +171,10 @@ def stream(channel_id):
     ch = manager.get_channel(channel_id)
     if not ch:
         return jsonify({"error": "channel not found"}), 404
-    
+
     if not ch.running:
-        return jsonify({"error": "channel not running"}), 503
-    
+        return jsonify({"error": "channel not running, start it first"}), 503
+
     def generate():
         q = ch.subscribe()
         try:
@@ -136,25 +183,25 @@ def stream(channel_id):
                 yield ch.video_init
             if ch.audio_init:
                 yield ch.audio_init
-            
+
             while ch.running:
                 try:
                     data = q.get(timeout=5)
                     yield data
                 except queue.Empty:
-                    # Keepalive — пустой пакет
                     continue
                 except GeneratorExit:
                     break
         finally:
             ch.unsubscribe(q)
-    
+
     return Response(
         generate(),
         mimetype="video/mp4",
         headers={
             "Cache-Control": "no-cache, no-store",
             "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
             "X-Channel-Id": channel_id,
             "X-Channel-Name": ch.name,
         }
@@ -163,19 +210,7 @@ def stream(channel_id):
 
 @app.route("/stream/<channel_id>/mpegts")
 def stream_mpegts(channel_id):
-    """
-    HTTP поток в MPEG-TS формате (через ffmpeg транскодинг на лету).
-    Совместим с ffmpeg -i, VLC, и стандартными скриптами записи.
-    """
-    ch = manager.get_channel(channel_id)
-    if not ch:
-        return jsonify({"error": "channel not found"}), 404
-    
-    if not ch.running:
-        return jsonify({"error": "channel not running"}), 503
-    
-    # TODO: запускать ffmpeg subprocess для конвертации fMP4 → MPEG-TS
-    # Пока отдаём сырые fMP4 сегменты
+    """MPEG-TS обёртка (пока отдаёт fMP4)"""
     return stream(channel_id)
 
 
@@ -190,23 +225,23 @@ def start_server():
     log.info(f"Video BW: {VIDEO_BW}")
     log.info(f"Autostart: {AUTOSTART}")
     log.info("=" * 60)
-    
+
     # Загружаем каналы
     if os.path.exists(M3U_PATH):
         manager.load_from_m3u(M3U_PATH, autostart=AUTOSTART, video_bw=VIDEO_BW)
     else:
         log.warning(f"M3U file not found: {M3U_PATH}")
         log.info("Use API POST /api/reload after placing M3U file")
-    
+
     # Graceful shutdown
     def shutdown(signum, frame):
         log.info("Shutting down...")
         manager.stop_all()
         sys.exit(0)
-    
+
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    
+
     # Запуск Flask
     app.run(host=HOST, port=PORT, threaded=True)
 

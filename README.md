@@ -1,92 +1,102 @@
 # BeeTV Restream Server
 
-DASH рестример для BeeTV.kz — скачивает DASH сегменты через edge-токен (307 redirect), отдаёт по HTTP.
+DASH restreamer for BeeTV.kz - downloads DASH segments via edge-token (307 redirect), serves as HTTP streams with a web panel.
 
-## Быстрый старт
+## Quick Start
 
 ```bash
-# 1. Клонируем
-git clone https://github.com/YOUR_REPO/beetv-restream.git
+# 1. Clone
+git clone https://github.com/amrink91/beetv-restream.git
 cd beetv-restream
 
-# 2. Кладём плейлист
-mkdir -p data
-cp /path/to/beetv_playlist.m3u data/
+# 2. Generate playlist (requires tokens from browser)
+python3 data/beetv_parser.py
 
-# 3. Запускаем
+# 3. Run
 docker-compose up -d
 
-# 4. Открываем панель
-# http://192.168.30.3:8080
+# 4. Open web panel
+# http://localhost:8080
 ```
 
-## Архитектура
+## Architecture
 
 ```
 BeeTV CDN (ucdn.beetv.kz)
-  │
-  │ 307 redirect → edge с токеном
-  │
-  ▼
+  |
+  | 307 redirect -> edge with token
+  v
 Python DASH Downloader
-  │ скачивает video+audio сегменты
-  │ обновляет токен каждые 80с
-  │
-  ▼
+  | downloads video+audio segments
+  | refreshes token every 80s
+  v
 Flask HTTP Server (:8080)
-  │
-  ├── /                      → Веб-панель
-  ├── /stream/{channel_id}   → HTTP поток (fMP4)
-  ├── /api/channels          → Список каналов
-  ├── /api/channels/{id}/start  → Запустить канал
-  ├── /api/channels/{id}/stop   → Остановить канал
-  └── /api/stats             → Статистика
+  |
+  |-- /                         -> Web Panel
+  |-- /stream/{channel_id}      -> HTTP stream (fMP4)
+  |-- /playlist.m3u             -> M3U playlist of all restreams
+  |-- /api/channels             -> Channel list
+  |-- /api/channels/{id}/start  -> Start channel
+  |-- /api/channels/{id}/stop   -> Stop channel
+  |-- /api/channels/{id}/status -> Channel status
+  |-- /api/stats                -> Global stats
+  |-- /api/start-all            -> Start all channels
+  |-- /api/stop-all             -> Stop all channels
+  |-- /api/reload               -> Reload M3U playlist
 ```
 
-## Использование
+## Web Panel Features
 
-### Веб-панель
-Открыть `http://192.168.30.3:8080` — поиск каналов, просмотр, копирование URL.
+- Channel list with real-time LIVE/OFF status
+- One-click stream URL copy button
+- Built-in video player
+- Search and filter (All / Live / Off)
+- Start All / Stop All / Reload controls
+- M3U playlist export for all restreams
+- Auto-refresh every 4 seconds
+- Uptime, segments, errors, clients stats per channel
 
-### Запись через ffmpeg
+## Usage
+
+### Watch in VLC
 ```bash
-ffmpeg -i "http://192.168.30.3:8080/stream/000001514" \
-  -c copy -y output.mp4
+vlc http://localhost:8080/stream/000001514
 ```
 
-### Запись с drawtext (как для остальных каналов)
+### Record with ffmpeg
 ```bash
-ffmpeg -i "http://192.168.30.3:8080/stream/000001514" \
-  -vf "drawtext=fontfile=/usr/share/fonts/Vera.ttf:text='%{localtime}':fontsize=17:x=(w-text_w)/2:y=h-line_h:box=1:boxcolor=white@0.5:boxborderw=5" \
-  -vcodec libx264 -preset veryfast -r 25 -b:v 320k -s 480x360 \
-  -acodec mp3 -b:a 60k \
-  output.mp4
+ffmpeg -i "http://localhost:8080/stream/000001514" -c copy output.mp4
 ```
 
-## Конфигурация (docker-compose.yml)
+### Download M3U playlist
+```bash
+curl -o restream.m3u http://localhost:8080/playlist.m3u
+```
 
-| Переменная | По умолчанию | Описание |
-|-----------|-------------|----------|
-| HTTP_PROXY | http://192.168.30.63:3129 | Прокси для доступа к BeeTV |
-| M3U_PATH | /data/beetv_playlist.m3u | Путь к плейлисту |
-| VIDEO_BW | 1087600 | Качество видео (bandwidth) |
-| AUTOSTART | false | Автозапуск всех каналов |
-| PORT | 8080 | Порт сервера |
+## Configuration (docker-compose.yml)
 
-### Качество видео (VIDEO_BW)
-- `562400` — 300x240 (минимум)
-- `1087600` — 480x384 (рекомендуется)
-- `1612400` — 576x460
-- `2137600` — 720x576 (максимум)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| HTTP_PROXY | http://192.168.30.63:3129 | Proxy for BeeTV access |
+| M3U_PATH | /data/beetv_playlist.m3u | Path to source playlist |
+| VIDEO_BW | 1087600 | Video quality (bandwidth) |
+| AUTOSTART | false | Auto-start all channels |
+| PORT | 8080 | Server port |
 
-## Обновление плейлиста
+### Video Quality (VIDEO_BW)
+- `562400` - 300x240 (minimum)
+- `1087600` - 480x384 (recommended)
+- `1612400` - 576x460
+- `2137600` - 720x576 (maximum)
 
-1. Получить свежие токены из браузера (F12 → Network → beetv.kz)
-2. Отредактировать `data/beetv_parser.py` — вставить access_token и device_token
-3. Запустить: `python3 data/beetv_parser.py`
-4. API: `curl -X POST http://localhost:8080/api/reload`
+## Updating Playlist
 
-## Требования
+1. Get fresh tokens from browser (F12 -> Network -> beetv.kz)
+2. Edit `data/beetv_parser.py` - insert access_token and device_token
+3. Run: `python3 data/beetv_parser.py`
+4. Reload: `curl -X POST http://localhost:8080/api/reload`
+
+## Requirements
 - Docker + Docker Compose
-- Доступ к прокси 192.168.30.63:3129
-- ~4GB RAM для 199 каналов
+- Access to proxy
+- ~4GB RAM for 199 channels
