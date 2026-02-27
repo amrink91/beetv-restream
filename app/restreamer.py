@@ -7,6 +7,7 @@ BeeTV DASH + HLS Restreamer
 
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -19,6 +20,13 @@ import urllib.request
 import urllib.error
 
 log = logging.getLogger("restreamer")
+
+# Лимит одновременных HTTP запросов (чтобы не перегружать прокси)
+MAX_CONCURRENT_HTTP = int(os.environ.get("MAX_CONCURRENT_HTTP", "30"))
+_http_semaphore = threading.Semaphore(MAX_CONCURRENT_HTTP)
+
+# Задержка при старте каналов (секунды, разброс)
+STAGGER_MAX_DELAY = int(os.environ.get("STAGGER_DELAY", "40"))
 
 # ============================================================
 # Конфигурация
@@ -154,13 +162,14 @@ def get_opener():
 
 
 def http_get(url: str, timeout: int = 15) -> Tuple[bytes, str]:
-    """HTTP GET через прокси. Возвращает (data, final_url)."""
-    req = urllib.request.Request(url, headers={"User-Agent": "BeeTV-Restreamer/1.0"})
-    resp = get_opener().open(req, timeout=timeout)
-    return resp.read(), resp.geturl()
+    """HTTP GET через прокси с семафором. Возвращает (data, final_url)."""
+    with _http_semaphore:
+        req = urllib.request.Request(url, headers={"User-Agent": "BeeTV-Restreamer/1.0"})
+        resp = get_opener().open(req, timeout=timeout)
+        return resp.read(), resp.geturl()
 
 
-def http_get_data(url: str, timeout: int = 10) -> Optional[bytes]:
+def http_get_data(url: str, timeout: int = 15) -> Optional[bytes]:
     """Скачать данные, None при ошибке."""
     try:
         data, _ = http_get(url, timeout=timeout)
@@ -413,31 +422,52 @@ class DASHChannel(BaseChannel):
             log.error(f"[{self.name}] Init download error: {e}")
             return False
 
+    def _need_token_refresh(self) -> bool:
+        """Проверить нужен ли рефреш токена."""
+        return not self.edge_base_url or (time.time() - self.token_time > TOKEN_REFRESH_SEC)
+
     def _download_loop(self):
+        # Растянутый старт — чтобы не забить прокси 200 запросами сразу
+        delay = random.uniform(0, STAGGER_MAX_DELAY)
+        log.info(f"[{self.name}] DASH starting in {delay:.0f}s...")
+        time.sleep(delay)
+        if not self.running:
+            return
+
         log.info(f"[{self.name}] DASH download loop started")
+        mpd_logged = False
+
         while self.running:
             try:
-                if not self._refresh_token():
-                    time.sleep(5)
-                    continue
-                if not self._parse_mpd():
-                    log.warning(f"[{self.name}] MPD parse failed, retrying...")
-                    time.sleep(5)
-                    continue
+                # Рефреш токена ТОЛЬКО когда истёк
+                if self._need_token_refresh():
+                    if not self._refresh_token():
+                        time.sleep(5)
+                        continue
+                    if not self._parse_mpd():
+                        log.warning(f"[{self.name}] MPD parse failed")
+                        time.sleep(5)
+                        continue
+                    if not mpd_logged:
+                        log.info(f"[{self.name}] MPD: video={self.video.repr_id} segs={self.video.seg_count} "
+                                 f"audio={self.audio.repr_id} ts={self.video.timescale}")
+                        mpd_logged = True
 
-                log.info(f"[{self.name}] MPD: video={self.video.repr_id} segs={self.video.seg_count} "
-                         f"audio={self.audio.repr_id} ts={self.video.timescale}")
-
+                # Init сегменты (один раз)
                 if not self.merged_init:
                     if not self._download_init_segments():
                         time.sleep(5)
                         continue
 
+                # Обновляем MPD для свежего таймлайна (без рефреша токена)
+                if not self._parse_mpd():
+                    time.sleep(3)
+                    continue
+
                 v_start_idx = SEGMENT_SKIP_FROM_START
                 v_end_idx = self.video.seg_count - SEGMENT_SKIP_FROM_END
 
                 if v_end_idx <= v_start_idx:
-                    log.warning(f"[{self.name}] Not enough segments: count={self.video.seg_count}")
                     time.sleep(3)
                     continue
 
@@ -447,7 +477,8 @@ class DASHChannel(BaseChannel):
                     if not self.running:
                         break
 
-                    if time.time() - self.token_time > TOKEN_REFRESH_SEC:
+                    # Рефреш токена внутри цикла если истёк
+                    if self._need_token_refresh():
                         if not self._refresh_token():
                             break
                         if not self._parse_mpd():
@@ -471,17 +502,19 @@ class DASHChannel(BaseChannel):
                         self.audio_segments.append(SegmentData(at, a_data, seg_dur))
                         self._broadcast(v_data + a_data)
                         self.stats["segments_downloaded"] += 1
-                        if self.stats["segments_downloaded"] % 50 == 1:
+                        if self.stats["segments_downloaded"] <= 3 or self.stats["segments_downloaded"] % 100 == 0:
                             log.info(f"[{self.name}] seg #{self.stats['segments_downloaded']} "
                                      f"v={len(v_data)}b a={len(a_data)}b dur={seg_dur:.1f}s")
                         time.sleep(seg_dur * 0.8)
                     else:
                         self.stats["errors"] += 1
-                        log.warning(f"[{self.name}] Segment failed: idx={seg_idx} "
-                                    f"v={'ok' if v_data else 'FAIL'} a={'ok' if a_data else 'FAIL'}")
-                        time.sleep(0.5)
+                        if self.stats["errors"] <= 3:
+                            log.warning(f"[{self.name}] Segment failed: idx={seg_idx} "
+                                        f"v={'ok' if v_data else 'FAIL'} a={'ok' if a_data else 'FAIL'}")
+                        time.sleep(1)
 
-                time.sleep(1)
+                # Пауза между циклами таймлайна
+                time.sleep(2)
 
             except Exception as e:
                 log.error(f"[{self.name}] Download loop error: {e}")
@@ -628,6 +661,11 @@ class HLSChannel(BaseChannel):
 
     def _download_loop(self):
         """Основной цикл загрузки HLS сегментов"""
+        delay = random.uniform(0, STAGGER_MAX_DELAY)
+        log.info(f"[{self.name}] HLS starting in {delay:.0f}s...")
+        time.sleep(delay)
+        if not self.running:
+            return
         log.info(f"[{self.name}] HLS download loop started")
         while self.running:
             try:
