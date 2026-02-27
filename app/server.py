@@ -184,12 +184,12 @@ def stream(channel_id):
     def generate():
         q = ch.subscribe()
         try:
-            # Init сегменты только для DASH (fMP4)
+            # Init сегмент для DASH (merged fMP4 с обоими треками)
             if not is_hls:
-                if ch.video_init:
+                if ch.merged_init:
+                    yield ch.merged_init
+                elif ch.video_init:
                     yield ch.video_init
-                if ch.audio_init:
-                    yield ch.audio_init
 
             while ch.running:
                 try:

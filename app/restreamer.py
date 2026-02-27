@@ -37,6 +37,106 @@ def ns(tag):
 
 
 # ============================================================
+# MP4 Box utilities (для слияния video+audio init сегментов)
+# ============================================================
+def parse_mp4_boxes(data: bytes) -> list:
+    """Parse top-level MP4 boxes. Returns [(type_bytes, offset, size), ...]"""
+    boxes = []
+    pos = 0
+    end = len(data)
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos:pos+4], 'big')
+        box_type = data[pos+4:pos+8]
+        if size == 1 and pos + 16 <= end:
+            size = int.from_bytes(data[pos+8:pos+16], 'big')
+        elif size == 0:
+            size = end - pos
+        if size < 8 or pos + size > end:
+            break
+        boxes.append((box_type, pos, size))
+        pos += size
+    return boxes
+
+
+def extract_box(data: bytes, box_type: bytes) -> Optional[bytes]:
+    """Extract first box of given type."""
+    for btype, start, size in parse_mp4_boxes(data):
+        if btype == box_type:
+            return data[start:start+size]
+    return None
+
+
+def make_box(box_type: bytes, content: bytes) -> bytes:
+    """Create an MP4 box."""
+    size = 8 + len(content)
+    return size.to_bytes(4, 'big') + box_type + content
+
+
+def merge_fmp4_init(video_init: bytes, audio_init: bytes) -> Optional[bytes]:
+    """
+    Merge separate video and audio fMP4 init segments into one valid init.
+    Creates single moov with both tracks so players can decode the stream.
+    """
+    try:
+        ftyp = extract_box(video_init, b'ftyp') or b''
+
+        v_moov = extract_box(video_init, b'moov')
+        a_moov = extract_box(audio_init, b'moov')
+        if not v_moov or not a_moov:
+            log.warning("merge_fmp4_init: moov not found")
+            return None
+
+        v_content = v_moov[8:]
+        a_content = a_moov[8:]
+        v_boxes = parse_mp4_boxes(v_content)
+        a_boxes = parse_mp4_boxes(a_content)
+
+        merged = b''
+
+        # mvhd from video
+        for bt, s, sz in v_boxes:
+            if bt == b'mvhd':
+                merged += v_content[s:s+sz]
+                break
+
+        # video trak
+        for bt, s, sz in v_boxes:
+            if bt == b'trak':
+                merged += v_content[s:s+sz]
+                break
+
+        # audio trak
+        for bt, s, sz in a_boxes:
+            if bt == b'trak':
+                merged += a_content[s:s+sz]
+                break
+
+        # merged mvex (trex from both tracks)
+        trex_all = b''
+        for bt, s, sz in v_boxes:
+            if bt == b'mvex':
+                for cbt, cs, csz in parse_mp4_boxes(v_content[s+8:s+sz]):
+                    if cbt == b'trex':
+                        trex_all += v_content[s+8:s+sz][cs:cs+csz]
+                break
+        for bt, s, sz in a_boxes:
+            if bt == b'mvex':
+                for cbt, cs, csz in parse_mp4_boxes(a_content[s+8:s+sz]):
+                    if cbt == b'trex':
+                        trex_all += a_content[s+8:s+sz][cs:cs+csz]
+                break
+        if trex_all:
+            merged += make_box(b'mvex', trex_all)
+
+        result = ftyp + make_box(b'moov', merged)
+        log.info(f"Merged init: v={len(video_init)}b a={len(audio_init)}b → {len(result)}b")
+        return result
+    except Exception as e:
+        log.error(f"merge_fmp4_init failed: {e}")
+        return None
+
+
+# ============================================================
 # HTTP с прокси
 # ============================================================
 _opener = None
@@ -91,6 +191,7 @@ class BaseChannel:
         self.running = False
         self.video_init: Optional[bytes] = None
         self.audio_init: Optional[bytes] = None
+        self.merged_init: Optional[bytes] = None
         self._subscribers: List = []
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -294,33 +395,53 @@ class DASHChannel(BaseChannel):
 
     def _download_init_segments(self) -> bool:
         try:
-            self.video_init = http_get_data(self.video.init_url(self.edge_base_url))
-            self.audio_init = http_get_data(self.audio.init_url(self.edge_base_url))
+            v_url = self.video.init_url(self.edge_base_url)
+            a_url = self.audio.init_url(self.edge_base_url)
+            log.info(f"[{self.name}] Downloading init: {v_url[:80]}...")
+            self.video_init = http_get_data(v_url)
+            self.audio_init = http_get_data(a_url)
             if self.video_init and self.audio_init:
                 log.info(f"[{self.name}] Init segments: video={len(self.video_init)}b audio={len(self.audio_init)}b")
+                self.merged_init = merge_fmp4_init(self.video_init, self.audio_init)
+                if not self.merged_init:
+                    log.warning(f"[{self.name}] Init merge failed, using video-only fallback")
+                    self.merged_init = self.video_init
                 return True
+            log.error(f"[{self.name}] Init download failed: video={self.video_init is not None} audio={self.audio_init is not None}")
             return False
         except Exception as e:
-            log.error(f"[{self.name}] Init download failed: {e}")
+            log.error(f"[{self.name}] Init download error: {e}")
             return False
 
     def _download_loop(self):
+        log.info(f"[{self.name}] DASH download loop started")
         while self.running:
             try:
                 if not self._refresh_token():
                     time.sleep(5)
                     continue
                 if not self._parse_mpd():
+                    log.warning(f"[{self.name}] MPD parse failed, retrying...")
                     time.sleep(5)
                     continue
-                if not self.video_init or not self.audio_init:
+
+                log.info(f"[{self.name}] MPD: video={self.video.repr_id} segs={self.video.seg_count} "
+                         f"audio={self.audio.repr_id} ts={self.video.timescale}")
+
+                if not self.merged_init:
                     if not self._download_init_segments():
                         time.sleep(5)
                         continue
 
                 v_start_idx = SEGMENT_SKIP_FROM_START
                 v_end_idx = self.video.seg_count - SEGMENT_SKIP_FROM_END
-                live_idx = max(v_start_idx, v_end_idx - 5)
+
+                if v_end_idx <= v_start_idx:
+                    log.warning(f"[{self.name}] Not enough segments: count={self.video.seg_count}")
+                    time.sleep(3)
+                    continue
+
+                live_idx = max(v_start_idx, v_end_idx - 3)
 
                 for seg_idx in range(live_idx, v_end_idx):
                     if not self.running:
@@ -350,12 +471,16 @@ class DASHChannel(BaseChannel):
                         self.audio_segments.append(SegmentData(at, a_data, seg_dur))
                         self._broadcast(v_data + a_data)
                         self.stats["segments_downloaded"] += 1
+                        if self.stats["segments_downloaded"] % 50 == 1:
+                            log.info(f"[{self.name}] seg #{self.stats['segments_downloaded']} "
+                                     f"v={len(v_data)}b a={len(a_data)}b dur={seg_dur:.1f}s")
                         time.sleep(seg_dur * 0.8)
                     else:
                         self.stats["errors"] += 1
+                        log.warning(f"[{self.name}] Segment failed: idx={seg_idx} "
+                                    f"v={'ok' if v_data else 'FAIL'} a={'ok' if a_data else 'FAIL'}")
                         time.sleep(0.5)
 
-                log.debug(f"[{self.name}] Timeline exhausted, refreshing...")
                 time.sleep(1)
 
             except Exception as e:
@@ -363,6 +488,7 @@ class DASHChannel(BaseChannel):
                 self.stats["errors"] += 1
                 self.stats["last_error"] = str(e)[:200]
                 time.sleep(5)
+        log.info(f"[{self.name}] DASH download loop stopped")
 
     def get_status(self) -> dict:
         status = super().get_status()
@@ -502,6 +628,7 @@ class HLSChannel(BaseChannel):
 
     def _download_loop(self):
         """Основной цикл загрузки HLS сегментов"""
+        log.info(f"[{self.name}] HLS download loop started")
         while self.running:
             try:
                 # Обновляем токен
@@ -538,9 +665,10 @@ class HLSChannel(BaseChannel):
                         log.warning(f"[{self.name}] HLS segment failed: seq={seq}")
 
                 # Ждём перед следующим fetch
-                # Если скачали сегменты — ждём ~target_duration
-                # Если нет новых — ждём половину target_duration
                 if new_count > 0:
+                    if self.stats["segments_downloaded"] % 50 <= new_count:
+                        log.info(f"[{self.name}] HLS seg #{self.stats['segments_downloaded']} "
+                                 f"new={new_count} dur={self.target_duration:.1f}s")
                     time.sleep(self.target_duration * 0.8)
                 else:
                     time.sleep(self.target_duration * 0.4)
@@ -550,6 +678,7 @@ class HLSChannel(BaseChannel):
                 self.stats["errors"] += 1
                 self.stats["last_error"] = str(e)[:200]
                 time.sleep(5)
+        log.info(f"[{self.name}] HLS download loop stopped")
 
     def get_status(self) -> dict:
         status = super().get_status()

@@ -646,6 +646,7 @@
 <!-- ==================== TOASTS ==================== -->
 <div class="toast-container" id="toasts"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
 <script>
 // ============================================================
 // State
@@ -779,7 +780,7 @@ function render() {
             <div class="ch-actions">
                 <button class="ch-btn start" onclick="apiStartChannel('${c.channel_id}')">START</button>
                 <button class="ch-btn stop" onclick="apiStopChannel('${c.channel_id}')">STOP</button>
-                <button class="ch-btn play" onclick="openPlayer('${c.channel_id}','${escAttr(c.name)}')">PLAY</button>
+                <button class="ch-btn play" onclick="openPlayer('${c.channel_id}','${escAttr(c.name)}','${c.stream_type||"dash"}')">PLAY</button>
             </div>
         </div>`;
     }).join('');
@@ -810,26 +811,63 @@ function copyUrl(channelId, name, btn) {
 }
 
 // ============================================================
-// Player
+// Player (mpegts.js)
 // ============================================================
-function openPlayer(channelId, name) {
+let currentPlayer = null;
+
+function openPlayer(channelId, name, streamType) {
     const overlay = document.getElementById('modalOverlay');
     const video = document.getElementById('modalVideo');
     const url = `${window.location.origin}/stream/${channelId}`;
 
     document.getElementById('modalTitle').textContent = name;
     document.getElementById('modalUrl').textContent = url;
-    video.src = url;
+
+    // Destroy previous player
+    closePlayerInternal();
+
+    if (typeof mpegts !== 'undefined' && mpegts.isSupported()) {
+        const type = streamType === 'hls' ? 'mpegts' : 'mp4';
+        currentPlayer = mpegts.createPlayer({
+            type: type,
+            isLive: true,
+            url: url,
+        }, {
+            enableWorker: false,
+            liveBufferLatencyChasing: true,
+            liveBufferLatencyMaxLatency: 10,
+            liveBufferLatencyMinRemain: 2,
+        });
+        currentPlayer.attachMediaElement(video);
+        currentPlayer.load();
+        video.play().catch(() => {});
+    } else {
+        // Fallback
+        video.src = url;
+    }
+
     overlay.classList.add('open');
 }
 
-function closePlayer() {
-    const overlay = document.getElementById('modalOverlay');
+function closePlayerInternal() {
     const video = document.getElementById('modalVideo');
+    if (currentPlayer) {
+        try {
+            currentPlayer.pause();
+            currentPlayer.unload();
+            currentPlayer.detachMediaElement();
+            currentPlayer.destroy();
+        } catch(e) {}
+        currentPlayer = null;
+    }
     video.pause();
     video.removeAttribute('src');
     video.load();
-    overlay.classList.remove('open');
+}
+
+function closePlayer() {
+    closePlayerInternal();
+    document.getElementById('modalOverlay').classList.remove('open');
 }
 
 // ============================================================

@@ -2,7 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Зависимости
+# Системные зависимости (ffmpeg для отладки, curl для healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python зависимости
 RUN pip install --no-cache-dir flask gunicorn
 
 # Копируем приложение
