@@ -217,10 +217,10 @@ def stream(channel_id):
 
 
 # ============================================================
-# Startup
+# Startup — загрузка каналов при импорте (для Gunicorn)
 # ============================================================
-def start_server():
-    """Запуск сервера"""
+def _load_channels():
+    """Загрузить каналы из M3U при старте"""
     log.info("=" * 60)
     log.info("BeeTV Restream Server")
     log.info(f"M3U: {M3U_PATH}")
@@ -228,25 +228,27 @@ def start_server():
     log.info(f"Autostart: {AUTOSTART}")
     log.info("=" * 60)
 
-    # Загружаем каналы
     if os.path.exists(M3U_PATH):
         manager.load_from_m3u(M3U_PATH, autostart=AUTOSTART, video_bw=VIDEO_BW)
     else:
         log.warning(f"M3U file not found: {M3U_PATH}")
         log.info("Use API POST /api/reload after placing M3U file")
 
-    # Graceful shutdown
-    def shutdown(signum, frame):
-        log.info("Shutting down...")
-        manager.stop_all()
-        sys.exit(0)
 
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+# Загружаем каналы сразу при импорте модуля (работает и с Gunicorn, и напрямую)
+_load_channels()
 
-    # Запуск Flask
-    app.run(host=HOST, port=PORT, threaded=True)
+
+# Graceful shutdown
+def _shutdown(signum, frame):
+    log.info("Shutting down...")
+    manager.stop_all()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _shutdown)
+signal.signal(signal.SIGINT, _shutdown)
 
 
 if __name__ == "__main__":
-    start_server()
+    app.run(host=HOST, port=PORT, threaded=True)
