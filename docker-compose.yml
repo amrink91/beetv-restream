@@ -16,7 +16,7 @@ services:
       - https_proxy=http://192.168.30.63:3129
       - M3U_PATH=/data/beetv_playlist.m3u
       - VIDEO_BW=1087600
-      - AUTOSTART=false
+      - AUTOSTART=true
       - HOST=0.0.0.0
       - PORT=8080
     healthcheck:

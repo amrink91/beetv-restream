@@ -13,11 +13,11 @@ RUN mkdir -p /data
 
 EXPOSE 8080
 
-# Gunicorn с threads для streaming endpoints
+# Gunicorn: 1 worker (in-memory state), много threads для streaming
 CMD ["gunicorn", \
      "--bind", "0.0.0.0:8080", \
-     "--workers", "2", \
-     "--threads", "16", \
+     "--workers", "1", \
+     "--threads", "32", \
      "--timeout", "0", \
      "--keep-alive", "120", \
      "--access-logfile", "-", \
