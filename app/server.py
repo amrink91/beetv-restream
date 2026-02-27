@@ -165,7 +165,9 @@ def playlist_m3u():
 @app.route("/stream/<channel_id>")
 def stream(channel_id):
     """
-    HTTP поток канала в формате fMP4 сегментов.
+    HTTP поток канала.
+    DASH каналы: fMP4 (video/mp4)
+    HLS каналы: MPEG-TS (video/mp2t)
     ffmpeg -i http://server:8080/stream/000001514 -c copy out.mp4
     """
     ch = manager.get_channel(channel_id)
@@ -175,14 +177,19 @@ def stream(channel_id):
     if not ch.running:
         return jsonify({"error": "channel not running, start it first"}), 503
 
+    # Выбираем mimetype в зависимости от типа потока
+    is_hls = ch.stream_type == "hls"
+    mime = "video/mp2t" if is_hls else "video/mp4"
+
     def generate():
         q = ch.subscribe()
         try:
-            # Отправляем init сегменты если есть
-            if ch.video_init:
-                yield ch.video_init
-            if ch.audio_init:
-                yield ch.audio_init
+            # Init сегменты только для DASH (fMP4)
+            if not is_hls:
+                if ch.video_init:
+                    yield ch.video_init
+                if ch.audio_init:
+                    yield ch.audio_init
 
             while ch.running:
                 try:
@@ -197,21 +204,16 @@ def stream(channel_id):
 
     return Response(
         generate(),
-        mimetype="video/mp4",
+        mimetype=mime,
         headers={
             "Cache-Control": "no-cache, no-store",
             "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
             "X-Channel-Id": channel_id,
             "X-Channel-Name": ch.name,
+            "X-Stream-Type": ch.stream_type,
         }
     )
-
-
-@app.route("/stream/<channel_id>/mpegts")
-def stream_mpegts(channel_id):
-    """MPEG-TS обёртка (пока отдаёт fMP4)"""
-    return stream(channel_id)
 
 
 # ============================================================

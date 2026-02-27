@@ -764,6 +764,7 @@ function render() {
             </div>
             <div class="ch-meta">
                 <span>ID: ${c.channel_id}</span>
+                <span style="color:${c.stream_type==='hls'?'var(--amber)':'var(--accent-light)'}">${(c.stream_type||'dash').toUpperCase()}</span>
                 <span>${fmtNum(c.segments)} segs</span>
                 ${c.clients > 0 ? `<span>${c.clients} clients</span>` : ''}
                 ${c.errors > 0 ? `<span style="color:var(--red)">${c.errors} err</span>` : ''}
