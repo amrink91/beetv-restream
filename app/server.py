@@ -210,7 +210,6 @@ def stream(channel_id):
             "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
             "X-Channel-Id": channel_id,
-            "X-Channel-Name": ch.name,
             "X-Stream-Type": ch.stream_type,
         }
     )
