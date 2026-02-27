@@ -80,10 +80,76 @@ def make_box(box_type: bytes, content: bytes) -> bytes:
     return size.to_bytes(4, 'big') + box_type + content
 
 
+# ID для аудио-трека в объединённом init (видео остаётся с оригинальным ID)
+AUDIO_TRACK_ID = 2
+
+
+def _patch_tkhd_in_trak(trak_bytes: bytes, new_track_id: int) -> bytes:
+    """Patch track_ID в tkhd внутри trak бокса."""
+    data = bytearray(trak_bytes)
+    pos = 8  # skip trak header (size + type)
+    end = len(data)
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos:pos+4], 'big')
+        btype = data[pos+4:pos+8]
+        if size < 8 or pos + size > end:
+            break
+        if btype == b'tkhd':
+            version = data[pos + 8]
+            if version == 0:
+                tid_off = pos + 12 + 4 + 4  # fullbox(12) + creation(4) + modification(4)
+            else:
+                tid_off = pos + 12 + 8 + 8  # fullbox(12) + creation(8) + modification(8)
+            old_id = int.from_bytes(data[tid_off:tid_off+4], 'big')
+            data[tid_off:tid_off+4] = new_track_id.to_bytes(4, 'big')
+            log.debug(f"Patched tkhd track_id: {old_id} → {new_track_id}")
+            break
+        pos += size
+    return bytes(data)
+
+
+def patch_segment_track_id(segment_data: bytes, new_track_id: int) -> bytes:
+    """Patch track_ID в moof→traf→tfhd медиа-сегмента fMP4."""
+    data = bytearray(segment_data)
+    pos = 0
+    end = len(data)
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos:pos+4], 'big')
+        btype = data[pos+4:pos+8]
+        if size < 8 or pos + size > end:
+            break
+        if btype == b'moof':
+            ipos = pos + 8
+            iend = pos + size
+            while ipos + 8 <= iend:
+                isz = int.from_bytes(data[ipos:ipos+4], 'big')
+                itp = data[ipos+4:ipos+8]
+                if isz < 8 or ipos + isz > iend:
+                    break
+                if itp == b'traf':
+                    jpos = ipos + 8
+                    jend = ipos + isz
+                    while jpos + 8 <= jend:
+                        jsz = int.from_bytes(data[jpos:jpos+4], 'big')
+                        jtp = data[jpos+4:jpos+8]
+                        if jsz < 8 or jpos + jsz > jend:
+                            break
+                        if jtp == b'tfhd':
+                            # tfhd: size(4) + type(4) + version+flags(4) + track_ID(4)
+                            tid_off = jpos + 12
+                            data[tid_off:tid_off+4] = new_track_id.to_bytes(4, 'big')
+                            return bytes(data)
+                        jpos += jsz
+                ipos += isz
+            break
+        pos += size
+    return bytes(data)
+
+
 def merge_fmp4_init(video_init: bytes, audio_init: bytes) -> Optional[bytes]:
     """
-    Merge separate video and audio fMP4 init segments into one valid init.
-    Creates single moov with both tracks so players can decode the stream.
+    Merge video+audio fMP4 init → single moov with both tracks.
+    Audio track_ID перенумерован в AUDIO_TRACK_ID чтобы не конфликтовать с video.
     """
     try:
         ftyp = extract_box(video_init, b'ftyp') or b''
@@ -107,19 +173,20 @@ def merge_fmp4_init(video_init: bytes, audio_init: bytes) -> Optional[bytes]:
                 merged += v_content[s:s+sz]
                 break
 
-        # video trak
+        # video trak (оставляем track_id как есть)
         for bt, s, sz in v_boxes:
             if bt == b'trak':
                 merged += v_content[s:s+sz]
                 break
 
-        # audio trak
+        # audio trak — ПАТЧИМ track_id → AUDIO_TRACK_ID
         for bt, s, sz in a_boxes:
             if bt == b'trak':
-                merged += a_content[s:s+sz]
+                patched_trak = _patch_tkhd_in_trak(a_content[s:s+sz], AUDIO_TRACK_ID)
+                merged += patched_trak
                 break
 
-        # merged mvex (trex from both tracks)
+        # merged mvex (trex from both tracks, audio trex патчим)
         trex_all = b''
         for bt, s, sz in v_boxes:
             if bt == b'mvex':
@@ -131,13 +198,16 @@ def merge_fmp4_init(video_init: bytes, audio_init: bytes) -> Optional[bytes]:
             if bt == b'mvex':
                 for cbt, cs, csz in parse_mp4_boxes(a_content[s+8:s+sz]):
                     if cbt == b'trex':
-                        trex_all += a_content[s+8:s+sz][cs:cs+csz]
+                        # trex: size(4) + type(4) + version+flags(4) + track_ID(4)
+                        trex_bytes = bytearray(a_content[s+8:s+sz][cs:cs+csz])
+                        trex_bytes[12:16] = AUDIO_TRACK_ID.to_bytes(4, 'big')
+                        trex_all += bytes(trex_bytes)
                 break
         if trex_all:
             merged += make_box(b'mvex', trex_all)
 
         result = ftyp + make_box(b'moov', merged)
-        log.info(f"Merged init: v={len(video_init)}b a={len(audio_init)}b → {len(result)}b")
+        log.info(f"Merged init: v={len(video_init)}b a={len(audio_init)}b → {len(result)}b (audio track_id={AUDIO_TRACK_ID})")
         return result
     except Exception as e:
         log.error(f"merge_fmp4_init failed: {e}")
@@ -204,6 +274,7 @@ class BaseChannel:
         self._subscribers: List = []
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._recent_data: deque = deque(maxlen=5)  # Буфер последних сегментов
         self.stats = {
             "segments_downloaded": 0,
             "errors": 0,
@@ -235,6 +306,12 @@ class BaseChannel:
         with self._lock:
             self._subscribers.append(q)
             self.stats["clients"] = len(self._subscribers)
+            # Отдаём новому подписчику буфер последних сегментов — мгновенный старт
+            for data in self._recent_data:
+                try:
+                    q.put_nowait(data)
+                except Exception:
+                    pass
         return q
 
     def unsubscribe(self, q):
@@ -245,6 +322,7 @@ class BaseChannel:
 
     def _broadcast(self, data: bytes):
         with self._lock:
+            self._recent_data.append(data)  # Буферизуем для новых подписчиков
             dead = []
             for q in self._subscribers:
                 try:
@@ -500,7 +578,9 @@ class DASHChannel(BaseChannel):
                         seg_dur = self.video.seg_duration / self.video.timescale
                         self.video_segments.append(SegmentData(vt, v_data, seg_dur))
                         self.audio_segments.append(SegmentData(at, a_data, seg_dur))
-                        self._broadcast(v_data + a_data)
+                        # Патчим audio track_id → AUDIO_TRACK_ID чтобы совпадал с merged init
+                        a_patched = patch_segment_track_id(a_data, AUDIO_TRACK_ID)
+                        self._broadcast(v_data + a_patched)
                         self.stats["segments_downloaded"] += 1
                         if self.stats["segments_downloaded"] <= 3 or self.stats["segments_downloaded"] % 100 == 0:
                             log.info(f"[{self.name}] seg #{self.stats['segments_downloaded']} "
